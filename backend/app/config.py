@@ -74,8 +74,8 @@ class Config:
     UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "../uploads")
     ALLOWED_EXTENSIONS = {"pdf", "md", "txt", "markdown"}
 
-    DEFAULT_CHUNK_SIZE = 500
-    DEFAULT_CHUNK_OVERLAP = 50
+    DEFAULT_CHUNK_SIZE = int(os.environ.get("GRAPH_CHUNK_SIZE", "1000"))
+    DEFAULT_CHUNK_OVERLAP = int(os.environ.get("GRAPH_CHUNK_OVERLAP", "100"))
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get("OASIS_DEFAULT_MAX_ROUNDS", "10"))
     OASIS_SIMULATION_DATA_DIR = os.path.join(
         os.path.dirname(__file__), "../uploads/simulations"
@@ -121,6 +121,10 @@ class Config:
             errors.append("EMBEDDING_DIM must be a positive integer matching the embedding model output")
         if cls.GRAPHITI_STRUCTURED_OUTPUT_MODE not in {"json_object", "json_schema"}:
             errors.append("GRAPHITI_STRUCTURED_OUTPUT_MODE must be json_object or json_schema")
+        if cls.DEFAULT_CHUNK_SIZE < 1 or not (
+            0 <= cls.DEFAULT_CHUNK_OVERLAP < cls.DEFAULT_CHUNK_SIZE
+        ):
+            errors.append("GRAPH_CHUNK_SIZE must be positive and 0 <= GRAPH_CHUNK_OVERLAP < GRAPH_CHUNK_SIZE")
         if cls.DEBUG:
             warnings.warn("Flask DEBUG mode is enabled. Do not use in production.", RuntimeWarning)
         return errors

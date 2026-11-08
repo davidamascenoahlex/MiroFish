@@ -5,7 +5,8 @@ import atexit
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Any
+from functools import lru_cache
+from typing import Any, get_args
 
 from pydantic import BaseModel
 
@@ -39,6 +40,107 @@ class EdgeModel(BaseModel):
 EntityText = str
 
 
+_NEO4J_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _field_accepts_text(field_info: Any) -> bool:
+    annotation = field_info.annotation
+    return annotation is str or str in get_args(annotation)
+
+
+def _attribute_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            item_text = _attribute_text(item)
+            if item_text:
+                parts.append(f"{key}: {item_text}")
+        text = "; ".join(parts)
+    elif isinstance(value, (list, tuple)):
+        text = ", ".join(item for item in map(_attribute_text, value) if item)
+    else:
+        text = str(value).strip()
+    return text or None
+
+
+def _attribute_value(value: Any, accepts_text: bool) -> Any:
+    if accepts_text:
+        return _attribute_text(value)
+    if isinstance(value, _NEO4J_SCALAR_TYPES):
+        return value
+    if (
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, _NEO4J_SCALAR_TYPES) for item in value)
+    ):
+        return value
+    return None
+
+
+def normalize_ontology_attribute_response(
+    response: Any, model: type[BaseModel]
+) -> dict[str, Any]:
+    """Keep only declared ontology attributes, as flat values Neo4j can store.
+
+    Graphiti persists attribute-extraction output almost verbatim. In
+    json_object mode LLMs sometimes wrap it in an object keyed by the type
+    name, which Neo4j rejects as a Map property and fails the whole episode.
+    """
+    if not isinstance(response, dict):
+        return {}
+    fields = model.model_fields
+    wrapped = [
+        value
+        for key, value in response.items()
+        if key not in fields
+        and isinstance(value, dict)
+        and any(name in fields for name in value)
+    ]
+    candidate = dict(wrapped[0]) if len(wrapped) == 1 else {}
+    candidate.update(
+        (key, value)
+        for key, value in response.items()
+        if key in fields and value is not None
+    )
+    normalized: dict[str, Any] = {}
+    for name, value in candidate.items():
+        field_info = fields.get(name)
+        if field_info is None:
+            continue
+        value = _attribute_value(value, _field_accepts_text(field_info))
+        if value is not None:
+            normalized[name] = value
+    return normalized
+
+
+@lru_cache(maxsize=1)
+def _ontology_safe_llm_client_class():
+    from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
+
+    class OntologySafeOpenAIGenericClient(OpenAIGenericClient):
+        async def generate_response(
+            self, messages, response_model=None, *args, attribute_extraction=False, **kwargs
+        ):
+            response = await super().generate_response(
+                messages,
+                response_model,
+                *args,
+                attribute_extraction=attribute_extraction,
+                **kwargs,
+            )
+            if (
+                attribute_extraction
+                and isinstance(response_model, type)
+                and issubclass(response_model, (EntityModel, EdgeModel))
+            ):
+                return normalize_ontology_attribute_response(response, response_model)
+            return response
+
+    return OntologySafeOpenAIGenericClient
+
+
 class _GraphitiBackend:
     def __init__(self) -> None:
         errors = Config.validate()
@@ -70,14 +172,13 @@ class _GraphitiBackend:
         from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
         from graphiti_core.llm_client.config import LLMConfig
-        from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 
         llm_config = LLMConfig(
             api_key=Config.LLM_API_KEY,
             model=Config.LLM_MODEL_NAME,
             base_url=Config.LLM_BASE_URL,
         )
-        llm_client = OpenAIGenericClient(
+        llm_client = _ontology_safe_llm_client_class()(
             config=llm_config,
             structured_output_mode=Config.GRAPHITI_STRUCTURED_OUTPUT_MODE,
         )
@@ -273,11 +374,47 @@ class _EdgeNamespace:
         return [_Edge(edge) for edge in edges]
 
 
+class _Episode:
+    __slots__ = ("uuid_", "uuid", "group_id", "processed")
+
+    def __init__(self, episode: Any):
+        self.uuid_ = episode.uuid
+        self.uuid = episode.uuid
+        self.group_id = episode.group_id
+        # Graphiti commits episodes with their extracted data before add returns.
+        self.processed = True
+
+
+class _EpisodeNamespace:
+    def __init__(self, backend: _GraphitiBackend):
+        self._backend = backend
+
+    def get(
+        self, uuid_: str | None = None, graph_id: str | None = None, **_: Any
+    ) -> _Episode:
+        graph_id = _require_group_id(graph_id)
+        if not isinstance(uuid_, str) or not uuid_.strip():
+            raise ValueError("episode UUID is required")
+        from graphiti_core.errors import NodeNotFoundError
+        from graphiti_core.nodes import EpisodicNode
+
+        try:
+            episode = self._backend.run(
+                EpisodicNode.get_by_uuid(self._backend.graphiti.driver, uuid_)
+            )
+        except NodeNotFoundError as error:
+            raise NotFoundError(uuid_) from error
+        if episode.group_id != graph_id:
+            raise NotFoundError(uuid_)
+        return _Episode(episode)
+
+
 class _GraphNamespace:
     def __init__(self, backend: _GraphitiBackend):
         self._backend = backend
         self.node = _NodeNamespace(backend)
         self.edge = _EdgeNamespace(backend)
+        self.episode = _EpisodeNamespace(backend)
 
     def create(self, graph_id: str | None = None, **_: Any) -> None:
         _require_group_id(graph_id)
@@ -311,6 +448,20 @@ class _GraphNamespace:
     def delete(self, graph_id: str | None = None, **_: Any) -> None:
         graph_id = _require_group_id(graph_id)
         self._backend.run(self._backend.delete_group(graph_id))
+
+    def list_episodes(self, graph_id: str | None = None, **_: Any) -> list[dict[str, Any]]:
+        graph_id = _require_group_id(graph_id)
+        result = self._backend.run(
+            self._backend.graphiti.driver.execute_query(
+                "MATCH (e:Episodic {group_id: $group_id}) "
+                "RETURN e.uuid AS uuid, e.name AS name, e.content AS content",
+                group_id=graph_id,
+            )
+        )
+        return [
+            {"uuid": record["uuid"], "name": record["name"], "content": record["content"]}
+            for record in result.records
+        ]
 
     def add(
         self,

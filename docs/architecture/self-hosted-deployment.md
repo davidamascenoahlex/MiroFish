@@ -23,6 +23,9 @@ Status: approved for implementation.
 - Containers in one Pod share its network namespace and resource budget; this is not equivalent to a VM or namespace-level isolation.
 - Future applications are added only after their container, path route, resource allocation, and persistent-data needs are reviewed.
 - Interrupted Graphiti builds cannot resume legacy Zep batch IDs. The API returns a recoverable `409` and retains the partial graph; an explicit `force=true` rebuild deletes it after request validation.
+- Graphiti ingestion is synchronous. Simulation finalization confirms each accepted episode exists in its graph before reporting success; a missing episode, a different graph, or a database error keeps finalization failed. Confirmation retries do not replay activity writes.
+- Opening the simulation monitor restores existing progress and actions, including completed runs and pending finalization. It starts only an idle simulation, never sends an automatic forced restart, and reconciles ambiguous start responses through a status read. Reports remain unavailable for failed or unfinished runs.
+- Interviews automatically reopen a finalized, closed simulation using its saved OASIS databases and personas, without resetting users, replaying rounds, or rewriting reports and action logs. Context is rebuilt from recorded activity; transient model memory from a terminated process is not recoverable. The interview worker has its own append-only log and heartbeat, is closed on backend shutdown, and must be closed before explicitly restarting a simulation. Failed finalization and pending old IPC commands block recovery rather than replaying writes.
 
 ## Security and application requirements
 

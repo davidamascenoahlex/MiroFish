@@ -156,7 +156,9 @@ class ProjectManager:
             name=name,
             status=ProjectStatus.CREATED,
             created_at=now,
-            updated_at=now
+            updated_at=now,
+            chunk_size=Config.DEFAULT_CHUNK_SIZE,
+            chunk_overlap=Config.DEFAULT_CHUNK_OVERLAP,
         )
         
         # 创建项目目录结构

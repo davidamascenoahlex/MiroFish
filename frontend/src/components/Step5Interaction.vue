@@ -986,7 +986,8 @@ watch(() => props.simulationId, (newId) => {
 /* Left Panel - Report Style (与 Step4Report.vue 完全一致) */
 .left-panel.report-style {
   width: 45%;
-  min-width: 450px;
+  min-width: 0;
+  flex-shrink: 0;
   background: #FFFFFF;
   border-right: 1px solid #E5E7EB;
   overflow-y: auto;
@@ -1305,6 +1306,7 @@ watch(() => props.simulationId, (newId) => {
 /* Right Panel - Interaction */
 .right-panel {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background: #FFFFFF;
@@ -1314,6 +1316,8 @@ watch(() => props.simulationId, (newId) => {
 /* Action Bar - Professional Design */
 .action-bar {
   display: flex;
+  flex-wrap: wrap;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   padding: 14px 20px;
@@ -1357,10 +1361,13 @@ watch(() => props.simulationId, (newId) => {
 }
 
 .action-bar-tabs {
+  position: relative;
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: center;
   gap: 6px;
-  flex: 1;
+  flex: 1 1 420px;
   justify-content: flex-end;
 }
 
@@ -1378,6 +1385,13 @@ watch(() => props.simulationId, (newId) => {
   cursor: pointer;
   transition: all 0.2s ease;
   white-space: nowrap;
+  max-width: 100%;
+}
+
+.tab-pill > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .tab-pill:hover {
@@ -1805,7 +1819,8 @@ watch(() => props.simulationId, (newId) => {
 
 /* Agent Dropdown */
 .agent-dropdown {
-  position: relative;
+  position: static;
+  max-width: 100%;
 }
 
 .dropdown-arrow {
@@ -1821,15 +1836,17 @@ watch(() => props.simulationId, (newId) => {
 .dropdown-menu {
   position: absolute;
   top: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  min-width: 240px;
+  right: 0;
+  width: 320px;
+  max-width: 100%;
+  min-width: 0;
   background: #FFFFFF;
   border: 1px solid #E5E7EB;
   border-radius: 12px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.12), 0 4px 12px rgba(0, 0, 0, 0.06);
   max-height: 320px;
   overflow-y: auto;
+  overflow-x: hidden;
   z-index: 100;
 }
 

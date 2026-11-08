@@ -1598,6 +1598,12 @@ def start_simulation():
                 "error": t('api.simulationNotFound', id=simulation_id)
             }), 404
 
+        if SimulationRunner.is_interview_env_running(simulation_id):
+            return jsonify({
+                "success": False,
+                "error": "Close the interview environment before restarting the simulation",
+            }), 409
+
         force_restarted = False
         
         # 智能处理状态：如果准备工作已完成，允许重新启动
@@ -2389,13 +2395,6 @@ def interview_agent():
                 "error": t('api.invalidInterviewPlatform')
             }), 400
         
-        # 检查环境状态
-        if not SimulationRunner.check_env_alive(simulation_id):
-            return jsonify({
-                "success": False,
-                "error": t('api.envNotRunning')
-            }), 400
-        
         # 优化prompt，添加前缀避免Agent调用工具
         optimized_prompt = optimize_interview_prompt(prompt)
         
@@ -2524,13 +2523,6 @@ def interview_agents_batch():
                     "error": t('api.interviewListInvalidPlatform', index=i+1)
                 }), 400
 
-        # 检查环境状态
-        if not SimulationRunner.check_env_alive(simulation_id):
-            return jsonify({
-                "success": False,
-                "error": t('api.envNotRunning')
-            }), 400
-
         # 优化每个采访项的prompt，添加前缀避免Agent调用工具
         optimized_interviews = []
         for interview in interviews:
@@ -2629,13 +2621,6 @@ def interview_all_agents():
             return jsonify({
                 "success": False,
                 "error": t('api.invalidInterviewPlatform')
-            }), 400
-
-        # 检查环境状态
-        if not SimulationRunner.check_env_alive(simulation_id):
-            return jsonify({
-                "success": False,
-                "error": t('api.envNotRunning')
             }), 400
 
         # 优化prompt，添加前缀避免Agent调用工具

@@ -420,3 +420,135 @@ def test_graph_reset_and_memory_start_cannot_cross_between_delete_and_clear(
     assert results["start"][1] == 409
     assert runner_called == []
     assert project.graph_id is None
+
+
+def test_failed_build_resume_continues_in_the_existing_graph(monkeypatch):
+    project = _project(ProjectStatus.FAILED)
+    project.error = "previous failure"
+    created_threads = []
+    builder_calls = {}
+
+    class Tasks:
+        def create_task(self, _description):
+            return "task-2"
+
+        def update_task(self, *_args, **_kwargs):
+            pass
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def validate_batch_chunks(self, _chunks, batch_size):
+            pass
+
+        def create_graph(self, name, *, graph_id=None, graph_id_callback=None):
+            builder_calls["graph_id"] = graph_id
+            return graph_id
+
+        def set_ontology(self, graph_id, _ontology):
+            builder_calls["ontology_graph_id"] = graph_id
+
+        def add_text_batches(self, graph_id, chunks, *, batch_size, progress_callback, resume):
+            builder_calls["resume"] = resume
+            return SimpleNamespace(episode_uuids=["episode-1"], item_count=len(chunks))
+
+        def _wait_for_batch(self, _submission, _progress_callback):
+            return ["episode-1"]
+
+        def get_graph_data(self, _graph_id):
+            return {"node_count": 2, "edge_count": 1}
+
+    class Thread:
+        def __init__(self, *, target, daemon):
+            created_threads.append(target)
+
+        def start(self):
+            pass
+
+    def refuse_delete(_graph_id):
+        raise AssertionError("resume must keep the stored graph")
+
+    monkeypatch.setattr(graph_api.Config, "validate", classmethod(lambda cls: []))
+    monkeypatch.setattr(graph_api, "TaskManager", Tasks)
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+    monkeypatch.setattr(graph_api.threading, "Thread", Thread)
+    monkeypatch.setattr(graph_api, "_delete_graph_if_present", refuse_delete)
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: project),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_extracted_text",
+        classmethod(lambda _cls, _project_id: "source text"),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "save_project",
+        classmethod(lambda _cls, _project: None),
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context(
+        "/api/graph/build",
+        method="POST",
+        json={"project_id": "proj-1", "resume": True},
+    ):
+        body, status = _json_result(graph_api.build_graph())
+        assert project.error is None
+        created_threads[0]()
+
+    assert status == 200
+    assert body["data"]["resumed"] is True
+    assert builder_calls == {
+        "graph_id": "graph-1",
+        "ontology_graph_id": "graph-1",
+        "resume": True,
+    }
+    assert project.status == ProjectStatus.GRAPH_COMPLETED
+    assert project.graph_id == "graph-1"
+
+
+def test_resume_refuses_requests_that_could_lose_or_mismatch_graph_data(monkeypatch):
+    cases = [
+        (ProjectStatus.FAILED, {"resume": True, "force": True}, 400),
+        (ProjectStatus.FAILED, {"resume": "true"}, 400),
+        (ProjectStatus.ONTOLOGY_GENERATED, {"resume": True}, 409),
+        (ProjectStatus.FAILED, {"resume": True, "chunk_size": 1000}, 400),
+    ]
+    current = {}
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("rejected resume requests must not touch the graph")
+
+    monkeypatch.setattr(graph_api.Config, "validate", classmethod(lambda cls: []))
+    monkeypatch.setattr(graph_api, "_delete_graph_if_present", refuse)
+    monkeypatch.setattr(graph_api.threading, "Thread", refuse)
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: current["project"]),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "save_project",
+        classmethod(lambda _cls, _project: None),
+    )
+
+    app = Flask(__name__)
+    for project_status, payload, expected_status in cases:
+        graph_id = None if project_status == ProjectStatus.ONTOLOGY_GENERATED else "graph-1"
+        current["project"] = _project(project_status, graph_id=graph_id)
+        with app.test_request_context(
+            "/api/graph/build",
+            method="POST",
+            json={"project_id": "proj-1", **payload},
+        ):
+            body, status = _json_result(graph_api.build_graph())
+
+        assert status == expected_status, payload
+        assert body["success"] is False
+        assert current["project"].status == project_status
+        assert current["project"].graph_id == graph_id

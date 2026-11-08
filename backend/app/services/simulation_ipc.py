@@ -267,7 +267,7 @@ class SimulationIPCClient:
             timeout=timeout
         )
     
-    def check_env_alive(self) -> bool:
+    def check_env_alive(self, expected_pid: Optional[int] = None) -> bool:
         """
         检查模拟环境是否存活
         
@@ -280,8 +280,14 @@ class SimulationIPCClient:
         try:
             with open(status_file, 'r', encoding='utf-8') as f:
                 status = json.load(f)
+            if expected_pid is not None and status.get("pid") != expected_pid:
+                return False
+            if status.get("mode") == "interview":
+                timestamp = datetime.fromisoformat(status.get("timestamp", ""))
+                if not -5 <= (datetime.now() - timestamp).total_seconds() < 15:
+                    return False
             return status.get("status") == "alive"
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, TypeError, OSError):
             return False
 
 

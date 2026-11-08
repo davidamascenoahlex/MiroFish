@@ -27,6 +27,9 @@ from ..utils.zep import (
 )
 from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
+from ..utils.logger import get_logger
+
+logger = get_logger('mirofish.graph_builder')
 
 
 @dataclass
@@ -62,6 +65,9 @@ class GraphBuilderService:
     负责调用Zep API构建知识图谱
     """
     
+    EPISODE_ADD_ATTEMPTS = 2
+    EPISODE_RETRY_DELAY_SECONDS = 2.0
+
     def __init__(self, api_key: Optional[str] = None):
         if api_key:
             raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
@@ -329,8 +335,14 @@ class GraphBuilderService:
         batch_size: int = 350,
         progress_callback: Optional[Callable] = None,
         batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
+        *,
+        resume: bool = False,
     ) -> BatchSubmission:
-        """Add chunks sequentially as Graphiti episodes, without replaying writes."""
+        """Add chunks sequentially as Graphiti episodes, without replaying writes.
+
+        With resume=True, chunk episodes already stored with identical content
+        are reused, so a failed build continues where it stopped.
+        """
         if not graph_id:
             raise ValueError("graph_id is required")
         self.validate_batch_chunks(chunks, batch_size=batch_size)
@@ -338,21 +350,18 @@ class GraphBuilderService:
         if batch_created_callback:
             batch_created_callback(operation_id, operation_id)
 
+        stored = self._stored_chunk_episodes(graph_id) if resume else {}
+        reused = 0
         episode_uuids: List[str] = []
         total_batches = (len(chunks) + batch_size - 1) // batch_size
         for index, chunk in enumerate(chunks):
             batch_num = index // batch_size + 1
-            episode_uuid = str(
-                uuid.uuid5(uuid.NAMESPACE_URL, f"mirofish:{operation_id}:{index}")
-            )
-            self.client.graph.add(
-                graph_id=graph_id,
-                data=chunk,
-                type="text",
-                name=f"chunk-{index + 1}",
-                source_description="MiroFish source document chunk",
-                uuid=episode_uuid,
-            )
+            name = f"chunk-{index + 1}"
+            episode_uuid = self._stored_episode_uuid(stored, name, chunk)
+            if episode_uuid:
+                reused += 1
+            else:
+                episode_uuid = self._add_chunk_episode(graph_id, name, chunk)
             episode_uuids.append(episode_uuid)
             if progress_callback:
                 progress_callback(
@@ -365,12 +374,72 @@ class GraphBuilderService:
                     (index + 1) / len(chunks),
                 )
 
+        if resume:
+            logger.info(
+                f"Resumed graph {graph_id}: reused {reused}/{len(chunks)} chunk episodes"
+            )
         return BatchSubmission(
             batch_id=operation_id,
             operation_id=operation_id,
             episode_uuids=episode_uuids,
             item_count=len(chunks),
         )
+
+    def _stored_chunk_episodes(self, graph_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        stored: Dict[str, List[Dict[str, Any]]] = {}
+        for episode in self.client.graph.list_episodes(graph_id=graph_id):
+            stored.setdefault(episode.get("name"), []).append(episode)
+        return stored
+
+    @staticmethod
+    def _stored_episode_uuid(
+        stored: Dict[str, List[Dict[str, Any]]], name: str, chunk: str
+    ) -> Optional[str]:
+        episodes = stored.get(name)
+        if not episodes:
+            return None
+        for episode in episodes:
+            if episode.get("content") == chunk and episode.get("uuid"):
+                return episode["uuid"]
+        raise RuntimeError(
+            f"Stored episode {name} does not match the current text; "
+            "rebuild the graph with force=true"
+        )
+
+    def _add_chunk_episode(self, graph_id: str, name: str, chunk: str) -> str:
+        attempts = max(1, int(self.EPISODE_ADD_ATTEMPTS))
+        attempt = 1
+        while True:
+            try:
+                episode = self.client.graph.add(
+                    graph_id=graph_id,
+                    data=chunk,
+                    type="text",
+                    name=name,
+                    source_description="MiroFish source document chunk",
+                )
+            except Exception as error:
+                if attempt >= attempts:
+                    raise
+                logger.warning(
+                    f"Graphiti failed to add {name} to {graph_id} "
+                    f"(attempt {attempt}/{attempts}): {error}"
+                )
+                # The write may have committed before the error surfaced.
+                stored_uuid = self._stored_episode_uuid(
+                    self._stored_chunk_episodes(graph_id), name, chunk
+                )
+                if stored_uuid:
+                    return stored_uuid
+                time.sleep(self.EPISODE_RETRY_DELAY_SECONDS)
+                attempt += 1
+                continue
+            episode_uuid = getattr(episode, "uuid_", None) or getattr(
+                episode, "uuid", None
+            )
+            if not isinstance(episode_uuid, str) or not episode_uuid.strip():
+                raise RuntimeError("Graphiti graph.add returned no episode UUID")
+            return episode_uuid
 
     @staticmethod
     def build_operation_id(graph_id: str, chunks: List[str]) -> str:

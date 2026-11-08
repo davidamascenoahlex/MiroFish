@@ -108,7 +108,7 @@ def test_graph_builder_writes_chunks_sequentially_and_reports_progress():
     class GraphApi:
         def add(self, **kwargs):
             calls.append(kwargs)
-            return SimpleNamespace(uuid=kwargs["uuid"])
+            return SimpleNamespace(uuid=f"graphiti-episode-{len(calls)}")
 
     builder = object.__new__(GraphBuilderService)
     builder.client = SimpleNamespace(graph=GraphApi())
@@ -119,7 +119,10 @@ def test_graph_builder_writes_chunks_sequentially_and_reports_progress():
 
     assert [call["data"] for call in calls] == ["first", "second", "third"]
     assert all(call["graph_id"] == "graph-id" for call in calls)
-    assert len({call["uuid"] for call in calls}) == 3
+    assert all("uuid" not in call for call in calls)
+    assert submission.episode_uuids == [
+        "graphiti-episode-1", "graphiti-episode-2", "graphiti-episode-3"
+    ]
     assert submission.item_count == 3
     assert progress[-1][1] == 1.0
 

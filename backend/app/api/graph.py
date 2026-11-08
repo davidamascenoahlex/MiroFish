@@ -465,8 +465,9 @@ def _build_graph_impl():
         {
             "project_id": "proj_xxxx",  // 必填，来自接口1
             "graph_name": "图谱名称",    // 可选
-            "chunk_size": 500,          // 可选，默认500
-            "chunk_overlap": 50         // 可选，默认50
+            "chunk_size": 1000,         // 可选，默认取项目设置（新项目为 GRAPH_CHUNK_SIZE=1000）
+            "chunk_overlap": 100,       // 可选，默认取项目设置（新项目为 GRAPH_CHUNK_OVERLAP=100）
+            "resume": false             // 可选，失败后保留已写入的分块并从中断处继续
         }
         
     返回：
@@ -516,6 +517,18 @@ def _build_graph_impl():
                 "success": False,
                 "error": "force must be a JSON boolean"
             }), 400
+
+        resume = data.get('resume', False)  # 失败后从中断处继续，保留已写入的分块
+        if not isinstance(resume, bool):
+            return jsonify({
+                "success": False,
+                "error": "resume must be a JSON boolean"
+            }), 400
+        if resume and force:
+            return jsonify({
+                "success": False,
+                "error": "resume and force cannot both be true"
+            }), 400
         
         if project.status == ProjectStatus.CREATED:
             return jsonify({
@@ -537,9 +550,12 @@ def _build_graph_impl():
                 })
 
             project.status = ProjectStatus.FAILED
-            project.error = "Graph build task is no longer present; set force=true to rebuild"
+            project.error = (
+                "Graph build task is no longer present; "
+                "set resume=true to continue or force=true to rebuild"
+            )
             ProjectManager.save_project(project)
-            if not force:
+            if not force and not resume:
                 return jsonify({
                     "success": False,
                     "error": project.error,
@@ -558,6 +574,12 @@ def _build_graph_impl():
                     "message": t('progress.graphBuildComplete')
                 }
             })
+
+        if resume and (project.status != ProjectStatus.FAILED or not project.graph_id):
+            return jsonify({
+                "success": False,
+                "error": "resume requires a failed graph build with an existing graph_id"
+            }), 409
         
         # 获取配置
         graph_name = data.get('graph_name', project.name or 'MiroFish Graph')
@@ -575,6 +597,14 @@ def _build_graph_impl():
                 "error": "chunk_overlap must satisfy 0 <= chunk_overlap < chunk_size"
             }), 400
         
+        if resume and (
+            chunk_size != project.chunk_size or chunk_overlap != project.chunk_overlap
+        ):
+            return jsonify({
+                "success": False,
+                "error": "resume must keep the project's chunk_size and chunk_overlap"
+            }), 400
+
         # 更新项目配置
         project.chunk_size = chunk_size
         project.chunk_overlap = chunk_overlap
@@ -596,7 +626,7 @@ def _build_graph_impl():
             }), 400
 
         # Only mutate Cloud state after the complete rebuild request validates.
-        if project.status == ProjectStatus.FAILED or (
+        if (project.status == ProjectStatus.FAILED and not resume) or (
             force and project.status == ProjectStatus.GRAPH_COMPLETED
         ):
             graph_id_to_delete = project.graph_id
@@ -621,6 +651,8 @@ def _build_graph_impl():
         project.graph_build_task_id = task_id
         project.zep_batch_id = None
         project.zep_batch_operation_id = None
+        if resume:
+            project.error = None
         ProjectManager.save_project(project)
         
         # Capture locale before spawning background thread
@@ -668,6 +700,7 @@ def _build_graph_impl():
 
                 graph_id = builder.create_graph(
                     name=graph_name,
+                    graph_id=project.graph_id if resume else None,
                     graph_id_callback=remember_graph,
                 )
 
@@ -695,6 +728,7 @@ def _build_graph_impl():
                     chunks,
                     batch_size=350,
                     progress_callback=add_progress_callback,
+                    resume=resume,
                 )
 
                 task_manager.update_task(
@@ -772,7 +806,7 @@ def _build_graph_impl():
             "data": {
                 "project_id": project_id,
                 "task_id": task_id,
-                "resumed": False,
+                "resumed": resume,
                 "message": t('api.graphBuildStarted', taskId=task_id)
             }
         })

@@ -78,3 +78,11 @@ def test_malformed_neo4j_uri_returns_configuration_error(monkeypatch):
     _set_valid_graphiti_config(monkeypatch, "bolt://[::1")
 
     assert "NEO4J_URI must be a valid Neo4j URI" in Config.validate()
+
+
+def test_graph_chunk_overlap_must_be_smaller_than_chunk_size(monkeypatch):
+    _set_valid_graphiti_config(monkeypatch, "bolt://127.0.0.1:7687")
+    monkeypatch.setattr(Config, "DEFAULT_CHUNK_SIZE", 100)
+    monkeypatch.setattr(Config, "DEFAULT_CHUNK_OVERLAP", 100)
+
+    assert any("GRAPH_CHUNK_OVERLAP" in error for error in Config.validate())

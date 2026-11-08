@@ -227,6 +227,7 @@ class SimulationRunner:
     # 内存中的运行状态
     _run_states: Dict[str, SimulationRunState] = {}
     _processes: Dict[str, subprocess.Popen] = {}
+    _interview_processes: Dict[str, subprocess.Popen] = {}
     _action_queues: Dict[str, Queue] = {}
     _monitor_threads: Dict[str, threading.Thread] = {}
     _stdout_files: Dict[str, Any] = {}  # 存储 stdout 文件句柄
@@ -431,6 +432,9 @@ class SimulationRunner:
                 RunnerStatus.PAUSED,
                 RunnerStatus.STOPPING,
             }
+            interview_process = cls._interview_processes.get(simulation_id)
+            if interview_process is not None and interview_process.poll() is None:
+                raise ValueError("Close the interview environment before restarting the simulation")
             if (
                 existing and existing.runner_status in active_statuses
             ) or ZepGraphMemoryManager.get_updater(simulation_id) is not None:
@@ -1363,6 +1367,16 @@ class SimulationRunner:
     
     @classmethod
     def cleanup_simulation_logs(cls, simulation_id: str) -> Dict[str, Any]:
+        with cls._finalization_lock(simulation_id):
+            if cls.is_interview_env_running(simulation_id):
+                return {
+                    "success": False, "cleaned_files": [],
+                    "errors": ["Close the interview environment before deleting simulation data"],
+                }
+            return cls._cleanup_simulation_logs(simulation_id)
+
+    @classmethod
+    def _cleanup_simulation_logs(cls, simulation_id: str) -> Dict[str, Any]:
         """
         清理模拟的运行日志（用于强制重新开始模拟）
         
@@ -1457,6 +1471,15 @@ class SimulationRunner:
             return
         cls._cleanup_done = True
 
+        cleanup_failed = False
+        for simulation_id in list(cls._interview_processes):
+            try:
+                with cls._finalization_lock(simulation_id):
+                    cls._stop_interview_env(simulation_id)
+            except Exception:
+                cleanup_failed = True
+                logger.exception("Could not close interview environment: %s", simulation_id)
+
         updater_ids = set(ZepGraphMemoryManager.get_simulation_ids())
         simulation_ids = sorted(
             set(cls._processes)
@@ -1464,10 +1487,10 @@ class SimulationRunner:
             | updater_ids
         )
         if not simulation_ids:
+            cls._cleanup_done = cleanup_failed is False
             return
 
         logger.info("正在安全完成所有模拟进程与图谱写入...")
-        cleanup_failed = False
 
         # Each simulation follows the normal stop/finalization path: terminate
         # its producer, let the monitor consume the final action-log tail, and
@@ -1637,6 +1660,78 @@ class SimulationRunner:
     # ============== Interview 功能 ==============
     
     @classmethod
+    def is_interview_env_running(cls, simulation_id: str) -> bool:
+        process = cls._interview_processes.get(simulation_id)
+        return process is not None and process.poll() is None
+
+    @classmethod
+    def _stop_interview_env(cls, simulation_id: str) -> None:
+        process = cls._interview_processes.get(simulation_id)
+        if process is not None and process.poll() is None:
+            cls._terminate_process(process, simulation_id, timeout=5)
+        cls._interview_processes.pop(simulation_id, None)
+
+    @classmethod
+    def ensure_interview_env(cls, simulation_id: str, timeout: float = 60.0) -> None:
+        """Reopen only a finalized simulation's interview channel, never its rounds."""
+        if (
+            not simulation_id or simulation_id in {".", ".."}
+            or "/" in simulation_id or "\\" in simulation_id
+        ):
+            raise ValueError("Invalid simulation ID")
+
+        with cls._finalization_lock(simulation_id):
+            if cls.check_env_alive(simulation_id):
+                return
+            state = cls.get_run_state(simulation_id)
+            if (
+                state is None
+                or state.runner_status not in {RunnerStatus.COMPLETED, RunnerStatus.STOPPED}
+                or state.error
+                or ZepGraphMemoryManager.get_updater(simulation_id) is not None
+            ):
+                raise ValueError("Interview recovery requires a successfully finalized simulation")
+
+            sim_dir = os.path.abspath(os.path.join(cls.RUN_STATE_DIR, simulation_id))
+            config_path = os.path.join(sim_dir, "simulation_config.json")
+            if not os.path.isfile(config_path):
+                raise ValueError("Simulation configuration is missing")
+            commands_dir = os.path.join(sim_dir, "ipc_commands")
+            if os.path.isdir(commands_dir) and any(
+                name.endswith(".json") for name in os.listdir(commands_dir)
+            ):
+                raise ValueError("Cannot restore interviews with pending IPC commands")
+
+            cls._stop_interview_env(simulation_id)
+            script = os.path.abspath(os.path.join(cls.SCRIPTS_DIR, "restore_interview_env.py"))
+            env = os.environ.copy()
+            env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+            log_path = os.path.join(sim_dir, "interview.log")
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, "-u", script, "--config", config_path],
+                    cwd=sim_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                    env=env, start_new_session=True,
+                )
+            cls._interview_processes[simulation_id] = process
+            cls._cleanup_done = False
+            logger.info("Restoring interviews without replay: %s, pid=%s", simulation_id, process.pid)
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if process.poll() is not None:
+                        raise RuntimeError("Interview recovery failed; see interview.log")
+                    if cls.check_env_alive(simulation_id):
+                        return
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Interview recovery timed out; see interview.log")
+                    time.sleep(0.25)
+            except (RuntimeError, TimeoutError):
+                cls._stop_interview_env(simulation_id)
+                logger.exception("Interview recovery did not become ready: %s", simulation_id)
+                raise
+
+    @classmethod
     def check_env_alive(cls, simulation_id: str) -> bool:
         """
         检查模拟环境是否存活（可以接收Interview命令）
@@ -1651,7 +1746,12 @@ class SimulationRunner:
         if not os.path.exists(sim_dir):
             return False
 
+        process = cls._interview_processes.get(simulation_id)
+        if process is not None and process.poll() is not None:
+            return False
         ipc_client = SimulationIPCClient(sim_dir)
+        if process is not None:
+            return ipc_client.check_env_alive(expected_pid=process.pid)
         return ipc_client.check_env_alive()
 
     @classmethod
@@ -1723,10 +1823,8 @@ class SimulationRunner:
         if not os.path.exists(sim_dir):
             raise ValueError(f"模拟不存在: {simulation_id}")
 
+        cls.ensure_interview_env(simulation_id)
         ipc_client = SimulationIPCClient(sim_dir)
-
-        if not ipc_client.check_env_alive():
-            raise ValueError(f"模拟环境未运行或已关闭，无法执行Interview: {simulation_id}")
 
         logger.info(f"发送Interview命令: simulation_id={simulation_id}, agent_id={agent_id}, platform={platform}")
 
@@ -1785,10 +1883,8 @@ class SimulationRunner:
         if not os.path.exists(sim_dir):
             raise ValueError(f"模拟不存在: {simulation_id}")
 
+        cls.ensure_interview_env(simulation_id)
         ipc_client = SimulationIPCClient(sim_dir)
-
-        if not ipc_client.check_env_alive():
-            raise ValueError(f"模拟环境未运行或已关闭，无法执行Interview: {simulation_id}")
 
         logger.info(f"发送批量Interview命令: simulation_id={simulation_id}, count={len(interviews)}, platform={platform}")
 

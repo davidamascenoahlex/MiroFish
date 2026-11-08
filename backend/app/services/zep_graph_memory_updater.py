@@ -608,7 +608,9 @@ class ZepGraphMemoryUpdater:
                 )
             for episode_uuid in list(pending):
                 episode = call_graph_read_with_retry(
-                    lambda: self.client.graph.episode.get(uuid_=episode_uuid),
+                    lambda: self.client.graph.episode.get(
+                        uuid_=episode_uuid, graph_id=self.graph_id
+                    ),
                     operation_name=f"poll simulation episode {episode_uuid}",
                 )
                 if getattr(episode, "processed", False):
