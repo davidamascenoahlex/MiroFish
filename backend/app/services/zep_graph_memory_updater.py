@@ -14,9 +14,9 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
-    ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
-    call_zep_read_with_retry,
-    get_zep_client,
+    GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS,
+    call_graph_read_with_retry,
+    get_graphiti_client,
 )
 
 logger = get_logger('mirofish.zep_graph_memory_updater')
@@ -255,12 +255,9 @@ class ZepGraphMemoryUpdater:
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id or "unknown"
-        self.api_key = api_key or Config.ZEP_API_KEY
-        
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = get_zep_client(self.api_key)
+        if api_key:
+            raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
+        self.client = get_graphiti_client()
         
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -312,7 +309,7 @@ class ZepGraphMemoryUpdater:
     
     def stop(self):
         """Drain the worker, flush tail events, and wait for Cloud ingestion."""
-        deadline = time.time() + ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+        deadline = time.time() + GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS
         # Serialize the accepting->closed transition with add_activity's
         # check+enqueue operation. This closes the small race where a producer
         # could enqueue after both the worker and final flush had exited.
@@ -602,7 +599,7 @@ class ZepGraphMemoryUpdater:
             return
 
         if deadline is None:
-            deadline = time.time() + ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
+            deadline = time.time() + GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS
         while pending:
             if time.time() >= deadline:
                 raise TimeoutError(
@@ -610,7 +607,7 @@ class ZepGraphMemoryUpdater:
                     "episode(s) pending"
                 )
             for episode_uuid in list(pending):
-                episode = call_zep_read_with_retry(
+                episode = call_graph_read_with_retry(
                     lambda: self.client.graph.episode.get(uuid_=episode_uuid),
                     operation_name=f"poll simulation episode {episode_uuid}",
                 )

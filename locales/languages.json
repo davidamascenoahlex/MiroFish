@@ -16,8 +16,8 @@
     "llmInstruction": "Veuillez répondre en français."
   },
   "pt": {
-    "label": "Português",
-    "llmInstruction": "Por favor, responda em português."
+    "label": "Português (Brasil)",
+    "llmInstruction": "Por favor, responda em português do Brasil."
   },
   "ru": {
     "label": "Русский",

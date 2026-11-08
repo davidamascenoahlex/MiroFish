@@ -115,16 +115,21 @@ cp .env.example .env
 **必需的环境变量：**
 
 ```env
-# LLM API配置（支持 OpenAI SDK 格式的任意 LLM API）
-# 推荐使用阿里百炼平台qwen-plus模型：https://bailian.console.aliyun.com/
-# 注意消耗较大，可先进行小于40轮的模拟尝试
-LLM_API_KEY=your_api_key
-LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_MODEL_NAME=qwen-plus
+# Independent OpenAI-compatible chat and embedding endpoints
+LLM_API_KEY=your_chat_api_key
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL_NAME=gpt-4o-mini
+EMBEDDING_API_KEY=your_embedding_api_key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL_NAME=text-embedding-3-small
+EMBEDDING_DIM=1536
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Local Graphiti / Neo4j
+NEO4J_URI=bolt://127.0.0.1:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your_neo4j_password
+GRAPHITI_STRUCTURED_OUTPUT_MODE=json_object
+SECRET_KEY=your_random_flask_secret
 ```
 
 #### 2. 安装依赖

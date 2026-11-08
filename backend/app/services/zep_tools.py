@@ -12,7 +12,7 @@ import time
 import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
-from zep_cloud import NotFoundError
+from .graphiti_adapter import NotFoundError
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -20,10 +20,10 @@ from ..utils.llm_client import LLMClient
 from ..utils.locale import get_locale, t
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
 from ..utils.zep import (
-    call_zep_read_with_retry,
-    get_zep_client,
-    normalize_zep_search_limit,
-    normalize_zep_search_query,
+    call_graph_read_with_retry,
+    get_graphiti_client,
+    normalize_graph_search_limit,
+    normalize_graph_search_query,
 )
 
 logger = get_logger('mirofish.zep_tools')
@@ -428,11 +428,9 @@ class ZepToolsService:
     RETRY_DELAY = 2.0
     
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+        if api_key:
+            raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
+        self.client = get_graphiti_client()
         # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
         logger.info(t("console.zepToolsInitialized"))
@@ -447,7 +445,7 @@ class ZepToolsService:
     def _call_with_retry(self, func, operation_name: str, max_retries: int = None):
         """Retry one safe read using typed Zep/HTTPX error classification."""
 
-        return call_zep_read_with_retry(
+        return call_graph_read_with_retry(
             func,
             operation_name=operation_name,
             max_attempts=max_retries or self.MAX_RETRIES,
@@ -478,8 +476,8 @@ class ZepToolsService:
         """
         logger.info(t("console.graphSearch", graphId=graph_id, query=query[:50]))
         
-        zep_query = normalize_zep_search_query(query)
-        zep_limit = normalize_zep_search_limit(limit)
+        zep_query = normalize_graph_search_query(query)
+        zep_limit = normalize_graph_search_limit(limit)
 
         try:
             search_results = self._call_with_retry(
@@ -709,7 +707,7 @@ class ZepToolsService:
         logger.info(t("console.fetchedEdges", count=len(result)))
         return result
     
-    def get_node_detail(self, node_uuid: str) -> Optional[NodeInfo]:
+    def get_node_detail(self, node_uuid: str, graph_id: str) -> Optional[NodeInfo]:
         """
         获取单个节点的详细信息
         
@@ -723,7 +721,7 @@ class ZepToolsService:
         
         try:
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=node_uuid),
+                func=lambda: self.client.graph.node.get(uuid_=node_uuid, graph_id=graph_id),
                 operation_name=t("console.fetchNodeDetailOp", uuid=node_uuid[:8])
             )
             
@@ -1041,7 +1039,7 @@ class ZepToolsService:
                 continue
             try:
                 # 单独获取每个相关节点的信息
-                node = self.get_node_detail(uuid)
+                node = self.get_node_detail(uuid, graph_id=graph_id)
                 if node:
                     node_map[uuid] = node
                     entity_type = next((l for l in node.labels if l not in ["Entity", "Node"]), "实体")

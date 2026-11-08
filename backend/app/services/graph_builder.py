@@ -10,7 +10,7 @@ import threading
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 
-from zep_cloud import BatchAddItem, EntityEdgeSourceTarget, NotFoundError
+from .graphiti_adapter import EntityEdgeSourceTarget, EntityModel, EntityText, EdgeModel
 
 from ..config import Config
 from ..models.task import TaskManager, TaskStatus
@@ -22,10 +22,8 @@ from ..utils.ontology import (
     normalize_ontology_source_targets,
 )
 from ..utils.zep import (
-    ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
-    call_zep_read_with_retry,
-    get_zep_client,
-    is_retryable_zep_error,
+    call_graph_read_with_retry,
+    get_graphiti_client,
 )
 from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
@@ -65,13 +63,14 @@ class GraphBuilderService:
     """
     
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+        if api_key:
+            raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
+        errors = Config.validate()
+        if errors:
+            raise ValueError("Invalid Graphiti configuration: " + "; ".join(errors))
+        self.client = get_graphiti_client()
         self.task_manager = TaskManager()
-    
+
     def build_graph_async(
         self,
         text: str,
@@ -222,100 +221,19 @@ class GraphBuilderService:
         graph_id: str | None = None,
         graph_id_callback: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """Create a graph with a caller-durable ID and reconcile lost replies."""
-
+        """Allocate a graph partition ID; Graphiti stores it as group_id."""
         graph_id = graph_id or f"mirofish_{uuid.uuid4().hex[:16]}"
-        # Persist the client-generated ID before the non-idempotent POST so a
-        # later reset can clean up a graph whose successful response was lost.
         if graph_id_callback:
             graph_id_callback(graph_id)
-
-        try:
-            self.client.graph.create(
-                graph_id=graph_id,
-                name=name,
-                description="MiroFish Social Simulation Graph"
-            )
-        except Exception as error:
-            if not is_retryable_zep_error(error):
-                raise
-            reconciliation_error = None
-            for attempt in range(3):
-                try:
-                    call_zep_read_with_retry(
-                        lambda: self.client.graph.get(graph_id),
-                        operation_name=f"reconcile graph create {graph_id}",
-                    )
-                    reconciliation_error = None
-                    break
-                except NotFoundError as not_found:
-                    reconciliation_error = not_found
-                    if attempt < 2:
-                        time.sleep(attempt + 1)
-                except Exception as read_error:
-                    reconciliation_error = read_error
-                    break
-            if reconciliation_error is not None:
-                raise error from reconciliation_error
-
+        self.client.graph.create(graph_id=graph_id, name=name)
         return graph_id
 
-    @staticmethod
-    def build_operation_id(graph_id: str, chunks: List[str]) -> str:
-        payload_hash = hashlib.sha256("\0".join(chunks).encode("utf-8")).hexdigest()
-        return hashlib.sha256(
-            f"{graph_id}:{payload_hash}".encode("utf-8")
-        ).hexdigest()
-
-    def _find_batch_by_operation_id(
-        self,
-        graph_id: str,
-        operation_id: str,
-        *,
-        max_attempts: int = 3,
-    ) -> Any | None:
-        """Find one server-created batch after an ambiguous create reply."""
-
-        for attempt in range(1, max_attempts + 1):
-            matches: List[Any] = []
-            cursor: int | None = None
-            seen_cursors: set[int] = set()
-            while True:
-                page = call_zep_read_with_retry(
-                    lambda: self.client.batch.list(limit=100, cursor=cursor),
-                    operation_name=f"reconcile batch create {operation_id}",
-                )
-                for batch in getattr(page, "batches", None) or []:
-                    metadata = getattr(batch, "metadata", None) or {}
-                    if (
-                        metadata.get("mirofish_operation_id") == operation_id
-                        and metadata.get("graph_id") == graph_id
-                    ):
-                        matches.append(batch)
-                next_cursor = getattr(page, "next_cursor", None)
-                if next_cursor is None:
-                    break
-                if next_cursor == cursor or next_cursor in seen_cursors:
-                    raise RuntimeError("Zep batch list cursor did not advance")
-                seen_cursors.add(next_cursor)
-                cursor = next_cursor
-
-            if len(matches) > 1:
-                raise RuntimeError(
-                    f"Multiple Zep batches match operation {operation_id}; refusing ambiguity"
-                )
-            if matches:
-                return matches[0]
-            if attempt < max_attempts:
-                time.sleep(attempt)
-        return None
-    
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
         """设置图谱本体（公开方法）"""
         import warnings
         from typing import Optional
         from pydantic import Field
-        from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel
+        from .graphiti_adapter import EntityModel, EntityText, EdgeModel, EntityEdgeSourceTarget
         
         # 抑制 Pydantic v2 关于 Field(default=None) 的警告
         # 这是 Zep SDK 要求的用法，警告来自动态类创建，可以安全忽略
@@ -412,221 +330,62 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None,
         batch_created_callback: Optional[Callable[[str | None, str], None]] = None,
     ) -> BatchSubmission:
-        """Submit document chunks through Zep's current Batch API.
-
-        Mutating calls are deliberately not retried: create/add are not
-        documented as idempotent, and an ambiguous replay can duplicate graph
-        episodes. The returned batch identity allows callers to persist and
-        reconcile the operation instead.
-        """
-
+        """Add chunks sequentially as Graphiti episodes, without replaying writes."""
         if not graph_id:
             raise ValueError("graph_id is required")
         self.validate_batch_chunks(chunks, batch_size=batch_size)
-
-        total_chunks = len(chunks)
         operation_id = self.build_operation_id(graph_id, chunks)
         if batch_created_callback:
-            # Journal the deterministic operation before the server-generated
-            # batch ID POST. This leaves enough identity for later diagnosis
-            # even if both the response and immediate list reconciliation fail.
-            batch_created_callback(None, operation_id)
-
-        try:
-            batch = self.client.batch.create(
-                metadata={
-                    "mirofish_operation_id": operation_id,
-                    "graph_id": graph_id,
-                    "chunk_count": total_chunks,
-                }
-            )
-        except Exception as error:
-            if not is_retryable_zep_error(error):
-                raise
-            batch = self._find_batch_by_operation_id(graph_id, operation_id)
-            if batch is None:
-                raise RuntimeError(
-                    "Zep batch creation is unconfirmed and no matching operation was found"
-                ) from error
-        batch_id = getattr(batch, "batch_id", None)
-        if not batch_id:
-            raise RuntimeError("Zep Batch API returned no batch_id")
-        if batch_created_callback:
-            batch_created_callback(batch_id, operation_id)
+            batch_created_callback(operation_id, operation_id)
 
         episode_uuids: List[str] = []
-        for i in range(0, total_chunks, batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (total_chunks + batch_size - 1) // batch_size
-            
-            if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
-                progress_callback(
-                    t('progress.sendingBatch', current=batch_num, total=total_batches, chunks=len(batch_chunks)),
-                    progress
-                )
-            
-            items = [
-                BatchAddItem(
-                    type="graph_episode",
-                    graph_id=graph_id,
-                    data=chunk,
-                    data_type="text",
-                    source_description="MiroFish source document chunk",
-                    metadata={
-                        "mirofish_operation_id": operation_id,
-                        "chunk_index": i + offset,
-                        "chunk_sha256": hashlib.sha256(
-                            chunk.encode("utf-8")
-                        ).hexdigest(),
-                    },
-                )
-                for offset, chunk in enumerate(batch_chunks)
-            ]
-
-            expected_item_count = i + len(items)
-            try:
-                item_details = self.client.batch.add(
-                    batch_id=batch_id,
-                    items=items,
-                )
-            except Exception as e:
-                if progress_callback:
-                    progress_callback(t('progress.batchFailed', batch=batch_num, error=str(e)), 0)
-                if is_retryable_zep_error(e):
-                    recovered_items = self._reconcile_batch_item_count(
-                        batch_id,
-                        expected_item_count,
-                    )
-                    recovered_indexes = {
-                        getattr(item, "sequence_index", None)
-                        for item in recovered_items
-                    }
-                    if (
-                        len(recovered_items) == expected_item_count
-                        and recovered_indexes == set(range(expected_item_count))
-                    ):
-                        item_details = recovered_items[i:expected_item_count]
-                    else:
-                        raise RuntimeError(
-                            f"Zep batch {batch_id} item submission is unconfirmed; "
-                            "the draft was not processed or replayed"
-                        ) from e
-                else:
-                    raise RuntimeError(
-                        f"Zep batch {batch_id} item submission failed"
-                    ) from e
-
-            if len(item_details or []) != len(items):
-                recovered_items = self._reconcile_batch_item_count(
-                    batch_id,
-                    expected_item_count,
-                )
-                recovered_indexes = {
-                    getattr(item, "sequence_index", None)
-                    for item in recovered_items
-                }
-                if (
-                    len(recovered_items) == expected_item_count
-                    and recovered_indexes == set(range(expected_item_count))
-                ):
-                    item_details = recovered_items[i:expected_item_count]
-                else:
-                    raise RuntimeError(
-                        f"Zep batch {batch_id} acknowledged {len(item_details or [])} "
-                        f"of {len(items)} items"
-                    )
-            for item in item_details:
-                episode_uuid = getattr(item, "episode_uuid", None)
-                if episode_uuid:
-                    episode_uuids.append(episode_uuid)
-
-        try:
-            self.client.batch.process(batch_id=batch_id)
-        except Exception as error:
-            # A process response can be lost after the server accepted it.
-            # Reconcile with a safe GET instead of issuing a second POST.
-            summary = call_zep_read_with_retry(
-                lambda: self.client.batch.get(batch_id=batch_id),
-                operation_name=f"reconcile batch {batch_id}",
+        total_batches = (len(chunks) + batch_size - 1) // batch_size
+        for index, chunk in enumerate(chunks):
+            batch_num = index // batch_size + 1
+            episode_uuid = str(
+                uuid.uuid5(uuid.NAMESPACE_URL, f"mirofish:{operation_id}:{index}")
             )
-            if getattr(summary, "status", None) in {None, "draft"}:
-                raise RuntimeError(
-                    f"Zep batch {batch_id} processing is unconfirmed"
-                ) from error
+            self.client.graph.add(
+                graph_id=graph_id,
+                data=chunk,
+                type="text",
+                name=f"chunk-{index + 1}",
+                source_description="MiroFish source document chunk",
+                uuid=episode_uuid,
+            )
+            episode_uuids.append(episode_uuid)
+            if progress_callback:
+                progress_callback(
+                    t(
+                        'progress.sendingBatch',
+                        current=batch_num,
+                        total=total_batches,
+                        chunks=min(batch_size, len(chunks) - (batch_num - 1) * batch_size),
+                    ),
+                    (index + 1) / len(chunks),
+                )
 
         return BatchSubmission(
-            batch_id=batch_id,
+            batch_id=operation_id,
             operation_id=operation_id,
             episode_uuids=episode_uuids,
-            item_count=total_chunks,
+            item_count=len(chunks),
         )
 
     @staticmethod
-    def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:
-        """Validate every Batch API limit before the first Cloud mutation."""
+    def build_operation_id(graph_id: str, chunks: List[str]) -> str:
+        payload_hash = hashlib.sha256("\0".join(chunks).encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"{graph_id}:{payload_hash}".encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:
         if not chunks:
             raise ValueError("At least one text chunk is required")
-        if not 1 <= batch_size <= 350:
-            raise ValueError("batch_size must be between 1 and 350")
-        if len(chunks) > 50_000:
-            raise ValueError("A Zep batch cannot contain more than 50,000 items")
-        oversized = [index for index, chunk in enumerate(chunks) if len(chunk) > 10_000]
-        if oversized:
-            raise ValueError(
-                f"Zep batch item exceeds 10,000 characters at chunk {oversized[0]}"
-            )
-
-    def _list_batch_items(self, batch_id: str) -> List[Any]:
-        items: List[Any] = []
-        cursor: int | None = None
-        seen_cursors: set[int] = set()
-        while True:
-            page = call_zep_read_with_retry(
-                lambda: self.client.batch.list_items(
-                    batch_id=batch_id,
-                    limit=100,
-                    cursor=cursor,
-                ),
-                operation_name=f"list batch items {batch_id}",
-            )
-            items.extend(getattr(page, "items", None) or [])
-            next_cursor = getattr(page, "next_cursor", None)
-            if next_cursor is None:
-                break
-            if next_cursor == cursor or next_cursor in seen_cursors:
-                raise RuntimeError(f"Zep batch {batch_id} item cursor did not advance")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-        return items
-
-    def _reconcile_batch_item_count(
-        self,
-        batch_id: str,
-        expected_item_count: int,
-        *,
-        max_attempts: int = 3,
-    ) -> List[Any]:
-        """Allow a short propagation window after an ambiguous add reply."""
-
-        items: List[Any] = []
-        for attempt in range(1, max_attempts + 1):
-            items = self._list_batch_items(batch_id)
-            if len(items) >= expected_item_count:
-                return items
-            if attempt < max_attempts:
-                time.sleep(attempt)
-        return items
-
-    def get_batch_summary(self, batch_id: str) -> Any:
-        """Read a persisted batch identity for restart reconciliation."""
-
-        return call_zep_read_with_retry(
-            lambda: self.client.batch.get(batch_id=batch_id),
-            operation_name=f"get batch {batch_id}",
-        )
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        for index, chunk in enumerate(chunks):
+            if not isinstance(chunk, str) or not chunk.strip():
+                raise ValueError(f"Text chunk at index {index} must be a non-empty string")
 
     def _wait_for_batch(
         self,
@@ -634,146 +393,20 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None,
         timeout: int | None = None,
     ) -> List[str]:
-        """Wait for a Batch API terminal state and validate every item."""
-
-        timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
-        start_time = time.time()
-        terminal_states = {"succeeded", "partial", "failed", "invalid", "canceled"}
-
-        while True:
-            if time.time() - start_time > timeout:
-                raise TimeoutError(
-                    f"Zep batch {submission.batch_id} did not finish within {timeout}s"
-                )
-
-            summary = call_zep_read_with_retry(
-                lambda: self.client.batch.get(batch_id=submission.batch_id),
-                operation_name=f"poll batch {submission.batch_id}",
-            )
-            status = getattr(summary, "status", None)
-            progress = getattr(summary, "progress", None)
-            percent = float(getattr(progress, "percent_complete", 0) or 0) / 100
-            if progress_callback:
-                completed = int(getattr(progress, "succeeded_items", 0) or 0)
-                progress_callback(
-                    t(
-                        'progress.zepProcessing',
-                        completed=completed,
-                        total=submission.item_count,
-                        pending=max(submission.item_count - completed, 0),
-                        elapsed=int(time.time() - start_time),
-                    ),
-                    min(max(percent, 0.0), 1.0),
-                )
-
-            if status in terminal_states:
-                break
-            time.sleep(3)
-
-        items = self._list_batch_items(submission.batch_id)
-        if status != "succeeded":
-            failed_items = [
-                item for item in items
-                if getattr(item, "status", None) not in {"succeeded", "skipped"}
-            ]
-            first_error = getattr(failed_items[0], "error", None) if failed_items else None
-            raise RuntimeError(
-                f"Zep batch {submission.batch_id} ended as {status}; "
-                f"failed_items={len(failed_items)}; first_error={first_error}"
-            )
-        if len(items) != submission.item_count:
-            raise RuntimeError(
-                f"Zep batch {submission.batch_id} contains {len(items)} items, "
-                f"expected {submission.item_count}"
-            )
-
-        ordered_items = sorted(
-            items,
-            key=lambda item: getattr(item, "sequence_index", 0) or 0,
-        )
-        episode_uuids: List[str] = []
-        for item in ordered_items:
-            item_status = getattr(item, "status", None)
-            episode_uuid = getattr(item, "episode_uuid", None)
-            source_uuid = getattr(item, "source_uuid", None)
-            if item_status != "succeeded" or not episode_uuid:
-                raise RuntimeError(
-                    f"Zep batch {submission.batch_id} returned an incomplete item"
-                )
-            if source_uuid and source_uuid != episode_uuid:
-                raise RuntimeError(
-                    f"Zep batch {submission.batch_id} returned mismatched episode UUIDs"
-                )
-            episode_uuids.append(episode_uuid)
-
+        """Graphiti writes complete before add returns; no remote batch polling is needed."""
+        if len(submission.episode_uuids) != submission.item_count:
+            raise RuntimeError("Graphiti episode submission count does not match the input")
         if progress_callback:
             progress_callback(
                 t(
                     'progress.processingComplete',
-                    completed=len(episode_uuids),
+                    completed=submission.item_count,
                     total=submission.item_count,
                 ),
                 1.0,
             )
-        return episode_uuids
-    
-    def _wait_for_episodes(
-        self,
-        episode_uuids: List[str],
-        progress_callback: Optional[Callable] = None,
-        timeout: int = ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
-    ):
-        """等待所有 episode 处理完成（通过查询每个 episode 的 processed 状态）"""
-        if not episode_uuids:
-            if progress_callback:
-                progress_callback(t('progress.noEpisodesWait'), 1.0)
-            return
-        
-        start_time = time.time()
-        pending_episodes = set(episode_uuids)
-        completed_count = 0
-        total_episodes = len(episode_uuids)
-        
-        if progress_callback:
-            progress_callback(t('progress.waitingEpisodes', count=total_episodes), 0)
-        
-        while pending_episodes:
-            if time.time() - start_time > timeout:
-                if progress_callback:
-                    progress_callback(
-                        t('progress.episodesTimeout', completed=completed_count, total=total_episodes),
-                        completed_count / total_episodes
-                    )
-                raise TimeoutError(
-                    f"Zep episode processing timed out with "
-                    f"{len(pending_episodes)} episode(s) still pending"
-                )
-            
-            # 检查每个 episode 的处理状态
-            for ep_uuid in list(pending_episodes):
-                episode = call_zep_read_with_retry(
-                    lambda: self.client.graph.episode.get(uuid_=ep_uuid),
-                    operation_name=f"poll episode {ep_uuid}",
-                )
-                is_processed = getattr(episode, 'processed', False)
+        return submission.episode_uuids
 
-                if is_processed:
-                    pending_episodes.remove(ep_uuid)
-                    completed_count += 1
-            
-            elapsed = int(time.time() - start_time)
-            if progress_callback:
-                progress_callback(
-                    t('progress.zepProcessing', completed=completed_count, total=total_episodes, pending=len(pending_episodes), elapsed=elapsed),
-                    completed_count / total_episodes if total_episodes > 0 else 0
-                )
-            
-            if pending_episodes:
-                time.sleep(3)  # 每3秒检查一次
-        
-        if progress_callback:
-            progress_callback(t('progress.processingComplete', completed=completed_count, total=total_episodes), 1.0)
-    
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """获取图谱信息"""
         # 获取节点（分页）

@@ -208,6 +208,8 @@
     "generatingReportBtn": "启动中..."
   },
   "step4": {
+    "selectionReason": "选择理由",
+    "waitingToStart": "等待开始",
     "generatingSection": "正在生成{title}...",
     "goToInteraction": "进入深度互动",
     "waitingForReportAgent": "Waiting for Report Agent...",

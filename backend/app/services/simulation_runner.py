@@ -22,8 +22,8 @@ from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 from ..utils.zep import (
-    ZEP_HTTP_REQUEST_TIMEOUT_SECONDS,
-    ZEP_INGESTION_WAIT_TIMEOUT_SECONDS,
+    GRAPH_HTTP_REQUEST_TIMEOUT_SECONDS,
+    GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS,
 )
 from .zep_graph_memory_updater import ZepGraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
@@ -1025,8 +1025,8 @@ class SimulationRunner:
         ):
             wait_timeout = max(
                 30.0,
-                ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
-                + ZEP_HTTP_REQUEST_TIMEOUT_SECONDS
+                GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS
+                + GRAPH_HTTP_REQUEST_TIMEOUT_SECONDS
                 + 5,
             )
             monitor.join(timeout=wait_timeout)

@@ -208,6 +208,8 @@
     "generatingReportBtn": "Starting..."
   },
   "step4": {
+    "selectionReason": "Selection reason",
+    "waitingToStart": "Waiting to start",
     "generatingSection": "Generating {title}...",
     "goToInteraction": "Enter Deep Interaction",
     "waitingForReportAgent": "Waiting for Report Agent...",

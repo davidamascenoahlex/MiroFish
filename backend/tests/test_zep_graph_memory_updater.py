@@ -37,14 +37,18 @@ def _client(add):
 
 def _updater(monkeypatch, add, simulation_id="sim-1"):
     client = _client(add)
-    monkeypatch.setattr(updater_module, "get_zep_client", lambda _key: client)
+    monkeypatch.setattr(updater_module, "get_graphiti_client", lambda: client)
     updater = ZepGraphMemoryUpdater(
         "graph-1",
-        api_key="test-key",
         simulation_id=simulation_id,
     )
     updater.SEND_INTERVAL = 0
     return updater
+
+
+def test_legacy_cloud_credentials_are_rejected():
+    with pytest.raises(ValueError, match="Zep Cloud credentials are unsupported"):
+        ZepGraphMemoryUpdater("graph-1", api_key="legacy-test-key")
 
 
 def test_stop_drains_an_immediately_queued_tail_activity(monkeypatch):
@@ -187,7 +191,7 @@ def test_pending_episode_wait_has_a_deadline(monkeypatch):
         processed=False
     )
     timestamps = iter([0.0, 2.0])
-    monkeypatch.setattr(updater_module, "ZEP_INGESTION_WAIT_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(updater_module, "GRAPH_INGESTION_WAIT_TIMEOUT_SECONDS", 1)
     monkeypatch.setattr(updater_module.time, "time", lambda: next(timestamps))
     monkeypatch.setattr(updater_module.time, "sleep", lambda _seconds: None)
 

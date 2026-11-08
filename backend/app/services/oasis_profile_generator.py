@@ -21,10 +21,10 @@ from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
 from ..utils.openai_chat_compat import create_chat_completion, extract_chat_completion_text
 from ..utils.zep import (
-    call_zep_read_with_retry,
-    get_zep_client,
-    is_retryable_zep_error,
-    normalize_zep_search_query,
+    call_graph_read_with_retry,
+    get_graphiti_client,
+    is_retryable_graph_error,
+    normalize_graph_search_query,
 )
 from .zep_entity_reader import EntityNode, ZepEntityReader
 
@@ -261,16 +261,11 @@ class OasisProfileGenerator:
         )
         
         # Zep客户端用于检索丰富上下文
-        self.zep_api_key = zep_api_key or Config.ZEP_API_KEY
-        self.zep_client = None
+        if zep_api_key:
+            raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
+        self.zep_client = get_graphiti_client() if graph_id else None
         self.graph_id = graph_id
-        
-        if self.zep_api_key:
-            try:
-                self.zep_client = get_zep_client(self.zep_api_key)
-            except Exception as e:
-                logger.warning(f"Zep客户端初始化失败: {e}")
-    
+
     def generate_profile_from_entity(
         self, 
         entity: EntityNode, 
@@ -376,13 +371,13 @@ class OasisProfileGenerator:
             logger.debug(f"跳过Zep检索：未设置graph_id")
             return results
         
-        comprehensive_query = normalize_zep_search_query(
+        comprehensive_query = normalize_graph_search_query(
             t('progress.zepSearchQuery', name=entity_name)
         )
         
         def search_edges():
             """搜索边（事实/关系）- 带重试机制"""
-            return call_zep_read_with_retry(
+            return call_graph_read_with_retry(
                 lambda: self.zep_client.graph.search(
                         query=comprehensive_query,
                         graph_id=self.graph_id,
@@ -395,7 +390,7 @@ class OasisProfileGenerator:
         
         def search_nodes():
             """搜索节点（实体摘要）- 带重试机制"""
-            return call_zep_read_with_retry(
+            return call_graph_read_with_retry(
                 lambda: self.zep_client.graph.search(
                         query=comprehensive_query,
                         graph_id=self.graph_id,
@@ -449,7 +444,7 @@ class OasisProfileGenerator:
             
         except Exception as e:
             logger.warning(f"Zep检索失败 ({entity_name}): {e}")
-            if not is_retryable_zep_error(e):
+            if not is_retryable_graph_error(e):
                 raise
         
         return results

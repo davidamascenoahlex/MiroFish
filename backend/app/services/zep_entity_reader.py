@@ -5,12 +5,12 @@ Zep实体读取与过滤服务
 
 from typing import Dict, Any, List, Optional, Set, Callable, TypeVar
 from dataclasses import dataclass, field
-from zep_cloud import NotFoundError
+from .graphiti_adapter import NotFoundError
 
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.zep_paging import fetch_all_nodes, fetch_all_edges
-from ..utils.zep import call_zep_read_with_retry, get_zep_client
+from ..utils.zep import call_graph_read_with_retry, get_graphiti_client
 
 logger = get_logger('mirofish.zep_entity_reader')
 
@@ -78,11 +78,9 @@ class ZepEntityReader:
     """
     
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = get_zep_client(self.api_key)
+        if api_key:
+            raise ValueError("Zep Cloud credentials are unsupported; configure Graphiti and Neo4j")
+        self.client = get_graphiti_client()
     
     def _call_with_retry(
         self, 
@@ -103,7 +101,7 @@ class ZepEntityReader:
         Returns:
             API调用结果
         """
-        return call_zep_read_with_retry(
+        return call_graph_read_with_retry(
             func,
             operation_name=operation_name,
             max_attempts=max_retries,
@@ -174,7 +172,7 @@ class ZepEntityReader:
         """
         获取指定节点的相关边。
 
-        Zep Cloud 3.25 的 ``graph.node.get_edges`` 实测只返回节点作为
+        Graphiti 的 ``graph.node.get_edges`` 实测只返回节点作为
         source 的边，尽管文档将其描述为“all edges”。需要完整上下文时必须
         提供 graph_id，以全图分页后同时筛选 incoming 和 outgoing 边。
         
@@ -354,7 +352,7 @@ class ZepEntityReader:
         try:
             # 使用重试机制获取节点
             node = self._call_with_retry(
-                func=lambda: self.client.graph.node.get(uuid_=entity_uuid),
+                func=lambda: self.client.graph.node.get(uuid_=entity_uuid, graph_id=graph_id),
                 operation_name=f"获取节点详情(uuid={entity_uuid[:8]}...)"
             )
             
